@@ -1,0 +1,225 @@
+<!doctype html>
+<style>
+	.column {
+		float: left;
+		width: 50%;
+	}
+	.row:after {
+		content: "";
+		display: table;
+		clear: both;
+	}
+</style>
+
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+		<title>reveal.js</title>
+
+		<link rel="stylesheet" href="dist/reset.css">
+		<link rel="stylesheet" href="dist/reveal.css">
+		<link rel="stylesheet" href="dist/theme/black.css">
+
+		<!-- Theme used for syntax highlighted code -->
+		<link rel="stylesheet" href="plugin/highlight/monokai.css">
+	</head>
+	<body>
+		<div class="reveal">
+			<div class="slides">
+				<section><h2>Function transformer</h2></section>
+				<section>
+					<img src="images/transformer.png" alt="Transformer" />
+					<br> 
+					Q, K, V are are matrices containing scalar information of attention
+				</section>
+				<section>
+					The idea is to transform the Q, K, V matrices to contain functions to better the time-series processing.
+					<br><br>
+					This should allow to:
+					<ul>
+						<li>Process irregular samples</li>
+						<li>Expand to sequences containing a lot of information</li>
+						<li>Allow to reduce the memory footprint of the models</li>
+					</ul>
+				</section>
+				<section data-auto-animate>
+					<h3>Problems to solve along the way:</h3>
+					<br>
+					<ul>
+						<li>How to parametrize the functions?</li>
+						<li>How to transform the attention mechanism into function space?</li>
+						<li>Are Positional Embeddings needed?</li>
+						<li>How to make the learning process stable?</li>
+						<li>How to smoothen parameter (gradient) space of the function model</li>
+					</ul>
+					<br>
+					
+				</section>
+				<section data-auto-animate>
+					<div class="row">
+						<div class="column">
+							<h3 style="color:green">Solved:</h3>
+							<li>How to parametrize the functions?</li>
+							<li>How to transform the attention mechanism into function space?</li>
+							<li>Are Positional Embeddings needed?</li>
+							<li>How to make the learning process stable?</li>
+						</div>
+						<div class="column">
+							<h3 style="color:red">Unsolved:</h3>
+							<li>How to smoothen parameter (gradient) space of the function model</li>
+						</div>
+					
+				</section>
+				<section>
+					<section>
+						<h3>Parametrizing the functions</h3>
+						<br>
+						Functions are parametrized by the HiPPO matrices -- a set of matrices containing coefficients for an orthogonal polynomial approximation of the function under constraint of a given measure.
+						<!-- <img src="images/hippo_approx.png" alt="Function" /> -->
+						<video data-autoplay src="images/hippo_animation.mp4"></video>
+					</section>
+					<section>
+						<h3>Parametrizing the functions</h3>
+						<br>
+						Currently the HiPPO matrice is created only for the last step of the input time series. This however can be modified easily to include all steps or a subset of steps with little effort and computational cost.
+					</section>
+					<section>
+						<h3>Parametrizing the functions</h3>
+						<img src="images/multiheads.png" alt="Multiheads" height="400"/>
+						<br>
+						This transform is applied once in the first transformer layer and the rest of the operators are replaced with continuous operators.
+					</section>
+				</section>
+				<section>
+					<section>
+						<h3>Transforming the attention mechanism</h3>
+						<br>
+						<img src="images/attention.png" alt="Attention" />
+					</section>
+					<section>
+						<h3>Masking</h3>
+						<br>
+						Masking is removed from the attention mechanism as it's not needed in the function space.
+						If masking of the input signal is needed (e.g. for the training procedures) it can be applied before the function transform.
+					</section>
+					<section>
+						<h3>MatMul -> Conv</h3>
+						\[QK^T \to Conv(Q,K) \\
+						[B, H, N, {\color{red}D}] * [B, H, {\color{red}D}, N]	\to [B, H, N, N] \]
+						<pre>
+							<code data-line-numbers="3-7" class="language-python">b, h, n, d = q.shape
+output = torch.zeros((b, h, n, d)).to(device)
+for j in range(q.shape[-1]): 
+	q_poly = rearrange(q[:, :, :, j], 'b h n -> (b h) n')
+	k_poly = rearrange(k[:, :, :, j], 'b h n -> (b h) n')
+	output[:,:,:,j] = rearrange(hippo.convolve(q_poly, k_poly), 
+						'(b h) n -> b h n', b=b, h=h)
+							</code>
+						</pre>
+						<br>
+						Iterate over each of the functions (d) for all heads (h) and batches (b) and convolve them using lookup table and coefficients (n).
+					</section>
+					<section>
+						<h3>Matmul -> Conv</h3>
+						<!-- <br> -->
+						To convolve two orthogonal polynomial sums we can use the following formula:
+						\[
+						W_{Qi} = q_{i1}W_{1} + q_{i2}W_{2} + ... + q_{im}W_{m}\\
+						W_{Ki} = k_{i1}W_{1} + k_{i2}W_{2} + ... + k_{im}W_{m}\\
+						W_{Qi} * W_{Ki} = \sum_{j=1}^{m} \sum_{k=1}^{m} q_{ij}k_{ik}(W_{j}*W_{k}) \\
+						\]
+						<pre><code class="language-python">#conv matrix is a lookup table of convolutions of 
+#orthogonal polynomials (W_j * W_k)			
+scaling = torch.einsum("m n, m k -> m n k", Wk, Wq)
+output = torch.einsum("m n k, n k l -> m l", scaling,
+						self.conv_matrix)</code>
+						</pre>
+					</section>
+					<section>
+						<h3>Scaling</h3>
+						<br>
+						Initially scaling was done for each polynomial as:
+						\[q_{in} = \frac{q_{in}}{\sum_{j=1}^m q_{ij}}\]
+						This however caused the model to be unstable due to ever expanding values of the coefficients.
+						replaced with:
+						\[q_{in} = \frac{q_{in}}{\text{max}(|q_{i}|)}\]
+					</section>
+					<section>
+						<h3>Softmax</h3>
+						<br>
+						Softmax for function space is not needed as the coefficients are already normalized within scaling step.
+					</section>
+				</section>
+				<section>
+					<h3>Positional Embeddings</h3>
+					<br>
+					Positional embeddings are not needed as the functions are already parametrized by the position.
+				</section>
+				<section>
+					<h3>Stability of learning process</h3>
+					There are two problems with the stability of the learning process:
+					<ul>
+						<li>Expanding coefficients - allievieated through the scaling change</li>
+						<li color="red">Parameter space is weird for optimization algorithms</li>
+					</ul>
+				</section>
+				<section>
+					<section>
+						<h3>Simple task</h3>
+						<br>
+						The initial checking was on simple dataset of recognition of different written character based on time-series X,Y,Z readouts of the pen, across 20 classes.
+						<br>
+						The sequences are up to 205 steps of length and the pen is lifted between the characters.
+						<br>
+						Standard models are easily able to achieve ~100% accuracy on this dataset.
+					</section>
+					<section>
+						<h3>Checked further steps or variants:</h3>
+						<br>
+						<ul>
+							<li>Checked learning rate + simple scheduling</li>
+							<li>Gradient clipping helps with learning process significantly</li>
+							<li>Different optimizers -- Adam seems to be performing the best among differently parametrized SGD and Adam</li>
+							<li>Moving Layer norm before heads did not increase convergence speed (as per <a href=https://arxiv.org/abs/2002.04745>this paper</a>)</li>
+							<li>Biggest change in performance was to introduce staging</li>
+						</ul>
+					</section>
+					<section>
+						<h3>Staging</h3>
+						<br>
+						Instead of generating the HiPPO matrix for only final step, the matrix is generated in stages, which are then concatenated and used for the attention mechanism.
+						<br>
+						This increases overall stability and performance of the model, allowing it to achieve ~90% accuracy on the dataset.
+					</section>
+				</section>
+				<section>
+					<h3>Other ideas:</h3>
+					<br>
+					<ul>
+						<li></li>
+					</ul>
+				</section>
+				
+			</div>
+		</div>
+
+		<script src="plugin/math/math.js"></script>
+		<script src="dist/reveal.js"></script>
+		<script src="plugin/notes/notes.js"></script>
+		<script src="plugin/markdown/markdown.js"></script>
+		<script src="plugin/highlight/highlight.js"></script>
+		<script>
+			// More info about initialization & config:
+			// - https://revealjs.com/initialization/
+			// - https://revealjs.com/config/
+			Reveal.initialize({
+				hash: true,
+
+				// Learn about plugins: https://revealjs.com/plugins/
+				plugins: [ RevealMarkdown, RevealHighlight, RevealNotes, RevealMath.KaTeX ]
+			});
+		</script>
+	</body>
+</html>
