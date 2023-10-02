@@ -1,6 +1,8 @@
 <h2>Private repository for hosting presentations</h2>
+Github pages links to presentations:
+- [TBD]
 
-
+<h2>Based on:</h2>
 <p align="center">
   <a href="https://revealjs.com">
   <img src="https://hakim-static.s3.amazonaws.com/reveal-js/logo/v1/reveal-black-text-sticker.png" alt="reveal.js" width="500">
